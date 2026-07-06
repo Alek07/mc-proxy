@@ -13,8 +13,8 @@ use std::{
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long to wait when probing whether the backend is already awake.
-const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
+/// Budget for a full readiness probe (TCP connect + MC status round-trip).
+const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long the background wake task keeps retrying before giving up.
 const WAKE_DEADLINE: Duration = Duration::from_secs(120);
 /// Slightly under Railway's 10-min idle window, so we never claim
@@ -157,71 +157,74 @@ async fn handle_connection(
 
         // Login (2) or transfer (3, MC 1.20.5+): a real player joining -> wake the backend
         2 | 3 => {
-            // Fast probe: is the backend already awake and listening?
-            let probe = timeout(BACKEND_PROBE_TIMEOUT, TcpStream::connect(backend_addr)).await;
+            // Readiness probe: a bare TCP connect is NOT trustworthy here —
+            // Railway's edge accepts connections even while the service is
+            // asleep/booting. Only a real MC status response proves the
+            // server can take a login.
+            if backend_is_ready(backend_addr).await {
+                // Proven awake: open a fresh connection for the actual login
+                // (the probe connection is spent — servers close after status).
+                let server = TcpStream::connect(backend_addr).await?;
 
-            match probe {
-                Ok(Ok(server)) => {
-                    // Awake: proxy the login normally.
-                    waking.store(false, Ordering::Release);
-                    mark_awake(&awake_until);
+                waking.store(false, Ordering::Release);
+                mark_awake(&awake_until);
 
-                    let current = active.fetch_add(1, Ordering::AcqRel) + 1;
-                    println!("[conn] login attempt, active connections: {}", current);
+                let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                println!("[conn] login attempt, active connections: {}", current);
 
-                    let result = proxy_login(&mut client, server, &hs.raw).await;
+                let result = proxy_login(&mut client, server, &hs.raw).await;
 
-                    let current = active.fetch_sub(1, Ordering::AcqRel) - 1;
-                    println!("[conn] connection ended, active: {}", current);
-                    // Server stays up ~10 more min after the last player leaves.
-                    mark_awake(&awake_until);
+                let current = active.fetch_sub(1, Ordering::AcqRel) - 1;
+                println!("[conn] connection ended, active: {}", current);
+                // Server stays up ~10 more min after the last player leaves.
+                mark_awake(&awake_until);
 
-                    result
-                }
-                _ => {
-                    // Asleep: kick off the wake in the background (idempotent),
-                    // then deal with the player gracefully.
-                    println!("[conn] login while backend asleep — triggering wake");
-                    spawn_wake(backend_addr.to_string(), waking.clone(), awake_until.clone());
+                result
+            } else {
+                // Asleep: kick off the wake in the background (idempotent),
+                // then deal with the player gracefully.
+                println!("[conn] login while backend asleep — triggering wake");
+                spawn_wake(backend_addr.to_string(), waking.clone(), awake_until.clone());
 
-                    // Optionally hold the client, hoping the backend boots
-                    // before the vanilla client gives up (~30s). If it comes
-                    // up in time, the player joins seamlessly.
-                    if login_hold_secs > 0 {
-                        println!("[conn] holding client up to {}s...", login_hold_secs);
-                        if let Ok(Ok(server)) = timeout(
-                            Duration::from_secs(login_hold_secs),
-                            wait_for_backend(backend_addr),
-                        )
-                        .await
-                        {
-                            println!("[conn] backend came up during hold — seamless join");
-                            mark_awake(&awake_until);
-
-                            let current = active.fetch_add(1, Ordering::AcqRel) + 1;
-                            println!("[conn] login attempt, active connections: {}", current);
-
-                            let result = proxy_login(&mut client, server, &hs.raw).await;
-
-                            let current = active.fetch_sub(1, Ordering::AcqRel) - 1;
-                            println!("[conn] connection ended, active: {}", current);
-                            mark_awake(&awake_until);
-
-                            return result;
-                        }
-                        println!("[conn] hold expired, sending wake message instead");
-                    }
-
-                    // Friendly disconnect instead of a timeout screen.
-                    send_login_disconnect(
-                        &mut client,
-                        concat!(
-                            r"\u00a7e\u26a1 The server was asleep \u2014 waking it up now!\n",
-                            r"\u00a77Rejoin in ~30 seconds and you're in."
-                        ),
+                // Optionally hold the client, hoping the backend boots
+                // before the vanilla client gives up (~30s). If it comes
+                // up in time, the player joins seamlessly.
+                if login_hold_secs > 0 {
+                    println!("[conn] holding client up to {}s...", login_hold_secs);
+                    if timeout(
+                        Duration::from_secs(login_hold_secs),
+                        wait_until_ready(backend_addr),
                     )
                     .await
+                    .is_ok()
+                    {
+                        println!("[conn] backend came up during hold — seamless join");
+                        let server = TcpStream::connect(backend_addr).await?;
+                        mark_awake(&awake_until);
+
+                        let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                        println!("[conn] login attempt, active connections: {}", current);
+
+                        let result = proxy_login(&mut client, server, &hs.raw).await;
+
+                        let current = active.fetch_sub(1, Ordering::AcqRel) - 1;
+                        println!("[conn] connection ended, active: {}", current);
+                        mark_awake(&awake_until);
+
+                        return result;
+                    }
+                    println!("[conn] hold expired, sending wake message instead");
                 }
+
+                // Friendly disconnect instead of a timeout screen.
+                send_login_disconnect(
+                    &mut client,
+                    concat!(
+                        r"\u00a7e\u26a1 The server was asleep \u2014 waking it up now!\n",
+                        r"\u00a77Rejoin in ~30 seconds and you're in."
+                    ),
+                )
+                .await
             }
         }
 
@@ -243,9 +246,56 @@ fn is_probably_awake(awake_until: &Mutex<Option<Instant>>) -> bool {
         .map_or(false, |t| Instant::now() < t)
 }
 
-/// Spawns (at most one) background task that hammers the backend with
-/// connection attempts until it's up. The connection attempts themselves
-/// are what trigger Railway to wake the service.
+/// Returns true if the backend answers a real Minecraft status ping.
+/// This is the only trustworthy readiness signal: a bare TCP connect
+/// can succeed at Railway's edge even while the service is asleep or
+/// the MC server is still booting.
+async fn backend_is_ready(addr: &str) -> bool {
+    let attempt = async {
+        let mut s = TcpStream::connect(addr).await.ok()?;
+
+        // Handshake: id 0x00, protocol 0, addr "probe", port 0, next_state 1 (status)
+        let mut hs = Vec::new();
+        write_varint(&mut hs, 0x00);
+        write_varint(&mut hs, 0);
+        write_varint(&mut hs, 5);
+        hs.extend_from_slice(b"probe");
+        hs.extend_from_slice(&0u16.to_be_bytes());
+        write_varint(&mut hs, 1);
+        write_packet(&mut s, &hs).await.ok()?;
+
+        // Status Request (empty packet, id 0x00)
+        let mut req = Vec::new();
+        write_varint(&mut req, 0x00);
+        write_packet(&mut s, &req).await.ok()?;
+
+        // Any well-formed response means the MC server is alive.
+        // Generous max_len: the status JSON can include a ~30 KB favicon.
+        read_packet(&mut s, 64 * 1024).await.ok()?;
+        Some(())
+    };
+
+    timeout(BACKEND_PROBE_TIMEOUT, attempt)
+        .await
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// Loops until the backend passes a readiness probe. No internal
+/// deadline; callers wrap it in `timeout(...)`. The repeated connection
+/// attempts are also what trigger Railway to wake the service.
+async fn wait_until_ready(addr: &str) {
+    loop {
+        if backend_is_ready(addr).await {
+            return;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Spawns (at most one) background task that probes the backend until
+/// it's actually serving Minecraft, then clears the waking flag.
 fn spawn_wake(
     backend_addr: String,
     waking: Arc<AtomicBool>,
@@ -259,26 +309,15 @@ fn spawn_wake(
 
     tokio::spawn(async move {
         println!("[wake] starting wake attempts");
-        match connect_with_retry(&backend_addr, WAKE_DEADLINE).await {
-            Ok(_) => {
-                println!("[wake] backend is up");
+        match timeout(WAKE_DEADLINE, wait_until_ready(&backend_addr)).await {
+            Ok(()) => {
+                println!("[wake] backend is up and serving");
                 mark_awake(&awake_until);
             }
-            Err(e) => println!("[wake] gave up: {}", e),
+            Err(_) => println!("[wake] gave up: backend never became ready"),
         }
         waking.store(false, Ordering::Release);
     });
-}
-
-/// Loops until a connection to the backend succeeds. No internal deadline;
-/// callers wrap it in `timeout(...)`.
-async fn wait_for_backend(addr: &str) -> io::Result<TcpStream> {
-    loop {
-        match TcpStream::connect(addr).await {
-            Ok(stream) => return Ok(stream),
-            Err(_) => sleep(Duration::from_secs(1)).await,
-        }
-    }
 }
 
 /// Sends a Login Disconnect packet (login state, packet id 0x00) with a
@@ -339,8 +378,9 @@ fn json_escape(s: &str) -> String {
 }
 
 /// Answers the status request + ping/pong exchange ourselves,
-/// without touching the backend. The MOTD is built from the shared
-/// MOTD env var (plain text) plus a status suffix.
+/// without touching the backend. Asleep/waking show a status-only
+/// MOTD; up-and-empty shows the shared MOTD so it looks exactly
+/// like the real server.
 async fn handle_status_locally(
     client: &mut TcpStream,
     protocol: i32,
@@ -361,25 +401,20 @@ async fn handle_status_locally(
                 let version_name =
                     std::env::var("VERSION").unwrap_or_else(|_| "Sleeping".to_string());
 
-                // Shared with the itzg container via Railway shared/reference
-                // variable. Assumed plain text; escaped for JSON either way.
-                let motd_base = std::env::var("MOTD")
-                    .map(|m| json_escape(&m))
-                    .unwrap_or_else(|_| "Minecraft Server".to_string());
-
                 let motd = match state {
-                    SleepState::Waking => format!(
-                        r"{} \u00a78| \u00a7e\u26a1 Waking up... refresh in a moment!",
-                        motd_base
-                    ),
-                    SleepState::AwakeEmpty => format!(
-                        r"{} \u00a78| \u00a7a\u2714 Up \u2014 join right in!",
-                        motd_base
-                    ),
-                    SleepState::Asleep => format!(
-                        r"{} \u00a78| \u00a77\u26a1 Asleep \u2014 join to wake it up!",
-                        motd_base
-                    ),
+                    SleepState::Waking => {
+                        r"\u00a7e\u26a1 Waking up... refresh and join in a moment!".to_string()
+                    }
+                    SleepState::Asleep => {
+                        r"\u00a77\u26a1 Server is asleep \u2014 join to wake it up!".to_string()
+                    }
+                    SleepState::AwakeEmpty => {
+                        // Look exactly like the real server: just the shared MOTD
+                        // (Railway shared variable, same value the itzg container uses).
+                        std::env::var("MOTD")
+                            .map(|m| json_escape(&m))
+                            .unwrap_or_else(|_| "Minecraft Server".to_string())
+                    }
                 };
 
                 let json = format!(
@@ -566,32 +601,4 @@ fn write_varint(buf: &mut Vec<u8>, mut value: i32) {
             return;
         }
     }
-}
-
-async fn connect_with_retry(addr: &str, deadline: Duration) -> io::Result<TcpStream> {
-    println!("[retry] trying to connect to {}", addr);
-
-    timeout(deadline, async {
-        let mut attempt = 0;
-
-        loop {
-            attempt += 1;
-
-            match TcpStream::connect(addr).await {
-                Ok(stream) => {
-                    println!("[retry] connected after {} attempts", attempt);
-                    return Ok(stream);
-                }
-                Err(e) => {
-                    println!("[retry] attempt {} failed: {}", attempt, e);
-                    sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-    })
-    .await
-    .map_err(|_| {
-        println!("[retry] timeout reached, backend never woke up");
-        io::Error::new(io::ErrorKind::TimedOut, "backend boot timeout")
-    })?
 }
