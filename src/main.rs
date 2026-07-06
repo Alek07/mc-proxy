@@ -158,12 +158,13 @@ async fn handle_connection(
         // Login (2) or transfer (3, MC 1.20.5+): a real player joining -> wake the backend
         2 | 3 => {
             // Readiness probe: a bare TCP connect is NOT trustworthy here —
-            // Railway's edge accepts connections even while the service is
-            // asleep/booting. Only a real MC status response proves the
-            // server can take a login.
+            // Railway sometimes accepts-and-holds connections while the
+            // service is asleep/booting, so connect() succeeding proves
+            // nothing. Only a real MC status response does.
             if backend_is_ready(backend_addr).await {
-                // Proven awake: open a fresh connection for the actual login
-                // (the probe connection is spent — servers close after status).
+                println!("[conn] probe: backend ready — proxying login");
+                // Fresh connection for the actual login (the probe
+                // connection is spent — servers close after status).
                 let server = TcpStream::connect(backend_addr).await?;
 
                 waking.store(false, Ordering::Release);
@@ -183,7 +184,7 @@ async fn handle_connection(
             } else {
                 // Asleep: kick off the wake in the background (idempotent),
                 // then deal with the player gracefully.
-                println!("[conn] login while backend asleep — triggering wake");
+                println!("[conn] probe: backend not ready — triggering wake");
                 spawn_wake(backend_addr.to_string(), waking.clone(), awake_until.clone());
 
                 // Optionally hold the client, hoping the backend boots
@@ -247,9 +248,7 @@ fn is_probably_awake(awake_until: &Mutex<Option<Instant>>) -> bool {
 }
 
 /// Returns true if the backend answers a real Minecraft status ping.
-/// This is the only trustworthy readiness signal: a bare TCP connect
-/// can succeed at Railway's edge even while the service is asleep or
-/// the MC server is still booting.
+/// This is the only trustworthy readiness signal on Railway.
 async fn backend_is_ready(addr: &str) -> bool {
     let attempt = async {
         let mut s = TcpStream::connect(addr).await.ok()?;
