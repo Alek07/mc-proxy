@@ -6,13 +6,17 @@ use tokio::{
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait when probing whether the backend is already awake.
+const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
+/// How long the background wake task keeps retrying before giving up.
+const WAKE_DEADLINE: Duration = Duration::from_secs(120);
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -22,11 +26,21 @@ async fn main() -> io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "25565".to_string());
     let bind_addr = format!("0.0.0.0:{}", port);
 
+    // Optional: hold a joining player's connection up to this many seconds
+    // hoping the backend comes up in time (seamless join). 0 = disabled,
+    // players get the friendly "waking up" disconnect immediately.
+    let login_hold_secs: u64 = std::env::var("LOGIN_HOLD_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
     println!("Starting proxy on {}", bind_addr);
     println!("Backend: {}", backend_addr);
+    println!("Login hold: {}s", login_hold_secs);
 
     let listener = TcpListener::bind(&bind_addr).await?;
     let active = Arc::new(AtomicUsize::new(0));
+    let waking = Arc::new(AtomicBool::new(false));
 
     // Keepalive: only pings the backend while real players are connected
     {
@@ -55,10 +69,13 @@ async fn main() -> io::Result<()> {
         println!("[conn] new client: {}", addr);
 
         let active = active.clone();
+        let waking = waking.clone();
         let backend_addr = backend_addr.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(client, &backend_addr, active).await {
+            if let Err(e) =
+                handle_connection(client, &backend_addr, active, waking, login_hold_secs).await
+            {
                 println!("[conn] {}: {}", addr, e);
             }
         });
@@ -77,6 +94,8 @@ async fn handle_connection(
     mut client: TcpStream,
     backend_addr: &str,
     active: Arc<AtomicUsize>,
+    waking: Arc<AtomicBool>,
+    login_hold_secs: u64,
 ) -> io::Result<()> {
     let hs = timeout(HANDSHAKE_TIMEOUT, read_handshake(&mut client))
         .await
@@ -94,25 +113,83 @@ async fn handle_connection(
                 let _ = io::copy_bidirectional(&mut client, &mut server).await;
             } else {
                 // Backend is (probably) asleep. Answer locally, never touch it.
-                println!("[conn] status ping — answered locally, backend untouched");
-                timeout(STATUS_TIMEOUT, handle_status_locally(&mut client, hs.protocol))
-                    .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status timeout"))??;
+                let is_waking = waking.load(Ordering::Acquire);
+                println!(
+                    "[conn] status ping — answered locally (waking={}), backend untouched",
+                    is_waking
+                );
+                timeout(
+                    STATUS_TIMEOUT,
+                    handle_status_locally(&mut client, hs.protocol, is_waking),
+                )
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status timeout"))??;
             }
             Ok(())
         }
 
         // Login (2) or transfer (3, MC 1.20.5+): a real player joining -> wake the backend
         2 | 3 => {
-            let current = active.fetch_add(1, Ordering::AcqRel) + 1;
-            println!("[conn] login attempt, active connections: {}", current);
+            // Fast probe: is the backend already awake and listening?
+            let probe = timeout(BACKEND_PROBE_TIMEOUT, TcpStream::connect(backend_addr)).await;
 
-            let result = proxy_login(&mut client, backend_addr, &hs.raw).await;
+            match probe {
+                Ok(Ok(server)) => {
+                    // Awake: proxy the login normally.
+                    waking.store(false, Ordering::Release);
 
-            let current = active.fetch_sub(1, Ordering::AcqRel) - 1;
-            println!("[conn] connection ended, active: {}", current);
+                    let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    println!("[conn] login attempt, active connections: {}", current);
 
-            result
+                    let result = proxy_login(&mut client, server, &hs.raw).await;
+
+                    let current = active.fetch_sub(1, Ordering::AcqRel) - 1;
+                    println!("[conn] connection ended, active: {}", current);
+
+                    result
+                }
+                _ => {
+                    // Asleep: kick off the wake in the background (idempotent),
+                    // then deal with the player gracefully.
+                    println!("[conn] login while backend asleep — triggering wake");
+                    spawn_wake(backend_addr.to_string(), waking.clone());
+
+                    // Optionally hold the client, hoping the backend boots
+                    // before the vanilla client gives up (~30s). If it comes
+                    // up in time, the player joins seamlessly.
+                    if login_hold_secs > 0 {
+                        println!("[conn] holding client up to {}s...", login_hold_secs);
+                        if let Ok(Ok(server)) = timeout(
+                            Duration::from_secs(login_hold_secs),
+                            wait_for_backend(backend_addr),
+                        )
+                        .await
+                        {
+                            println!("[conn] backend came up during hold — seamless join");
+                            let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                            println!("[conn] login attempt, active connections: {}", current);
+
+                            let result = proxy_login(&mut client, server, &hs.raw).await;
+
+                            let current = active.fetch_sub(1, Ordering::AcqRel) - 1;
+                            println!("[conn] connection ended, active: {}", current);
+
+                            return result;
+                        }
+                        println!("[conn] hold expired, sending wake message instead");
+                    }
+
+                    // Friendly disconnect instead of a timeout screen.
+                    send_login_disconnect(
+                        &mut client,
+                        concat!(
+                            r"\u00a7e\u26a1 The server was asleep \u2014 waking it up now!\n",
+                            r"\u00a77Rejoin in ~30 seconds and you're in."
+                        ),
+                    )
+                    .await
+                }
+            }
         }
 
         s => Err(io::Error::new(
@@ -122,15 +199,59 @@ async fn handle_connection(
     }
 }
 
+/// Spawns (at most one) background task that hammers the backend with
+/// connection attempts until it's up. The connection attempts themselves
+/// are what trigger Railway to wake the service.
+fn spawn_wake(backend_addr: String, waking: Arc<AtomicBool>) {
+    // swap returns the previous value: if it was already true, a wake
+    // task is running and we don't spawn a second one.
+    if waking.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        println!("[wake] starting wake attempts");
+        match connect_with_retry(&backend_addr, WAKE_DEADLINE).await {
+            Ok(_) => println!("[wake] backend is up"),
+            Err(e) => println!("[wake] gave up: {}", e),
+        }
+        waking.store(false, Ordering::Release);
+    });
+}
+
+/// Loops until a connection to the backend succeeds. No internal deadline;
+/// callers wrap it in `timeout(...)`.
+async fn wait_for_backend(addr: &str) -> io::Result<TcpStream> {
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(_) => sleep(Duration::from_secs(1)).await,
+        }
+    }
+}
+
+/// Sends a Login Disconnect packet (login state, packet id 0x00) with a
+/// JSON chat message, then closes. This is what the player sees instead
+/// of "Connection timed out". Works pre-compression/pre-encryption, which
+/// is exactly the state the connection is in at this point.
+async fn send_login_disconnect(client: &mut TcpStream, json_text: &str) -> io::Result<()> {
+    let json = format!(r#"{{"text":"{}"}}"#, json_text);
+
+    let mut body = Vec::with_capacity(json.len() + 8);
+    write_varint(&mut body, 0x00); // Login Disconnect packet id
+    write_varint(&mut body, json.len() as i32);
+    body.extend_from_slice(json.as_bytes());
+
+    write_packet(client, &body).await?;
+    client.flush().await?;
+    Ok(())
+}
+
 async fn proxy_login(
     client: &mut TcpStream,
-    backend_addr: &str,
+    mut server: TcpStream,
     handshake_raw: &[u8],
 ) -> io::Result<()> {
-    println!("[conn] connecting to backend...");
-
-    let mut server = connect_with_retry(backend_addr).await?;
-
     println!("[conn] backend connected, replaying handshake and starting proxy");
 
     // The backend never saw the handshake (we consumed it), so replay it first.
@@ -152,8 +273,12 @@ async fn proxy_login(
 }
 
 /// Answers the status request + ping/pong exchange ourselves with a
-/// "server is sleeping" MOTD, without waking the backend.
-async fn handle_status_locally(client: &mut TcpStream, protocol: i32) -> io::Result<()> {
+/// "server is sleeping" (or "waking up") MOTD, without waking the backend.
+async fn handle_status_locally(
+    client: &mut TcpStream,
+    protocol: i32,
+    is_waking: bool,
+) -> io::Result<()> {
     loop {
         let payload = read_packet(client, 128).await?;
         let mut idx = 0;
@@ -169,13 +294,19 @@ async fn handle_status_locally(client: &mut TcpStream, protocol: i32) -> io::Res
                 let version_name =
                     std::env::var("VERSION").unwrap_or_else(|_| "Sleeping".to_string());
 
+                let motd = if is_waking {
+                    r"\u00a7e\u26a1 Waking up... \u00a77refresh and join in a moment!"
+                } else {
+                    r"\u00a77\u26a1 Server is asleep \u2014 join to wake it up!"
+                };
+
                 let json = format!(
                     concat!(
                         r#"{{"version":{{"name":"{}","protocol":{}}},"#,
                         r#""players":{{"max":0,"online":0}},"#,
-                        r#""description":{{"text":"\u00a77\u26a1 Server is asleep \u2014 join to wake it up!"}}}}"#
+                        r#""description":{{"text":"{}"}}}}"#
                     ),
-                    version_name, protocol
+                    version_name, protocol, motd
                 );
 
                 let mut body = Vec::with_capacity(json.len() + 8);
@@ -355,9 +486,7 @@ fn write_varint(buf: &mut Vec<u8>, mut value: i32) {
     }
 }
 
-async fn connect_with_retry(addr: &str) -> io::Result<TcpStream> {
-    let deadline = Duration::from_secs(60);
-
+async fn connect_with_retry(addr: &str, deadline: Duration) -> io::Result<TcpStream> {
     println!("[retry] trying to connect to {}", addr);
 
     timeout(deadline, async {
