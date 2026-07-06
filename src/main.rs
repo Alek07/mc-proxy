@@ -321,10 +321,18 @@ fn spawn_wake(
 }
 
 /// Sends a Login Disconnect packet (login state, packet id 0x00) with a
-/// JSON chat message, then closes. This is what the player sees instead
-/// of "Connection timed out". Works pre-compression/pre-encryption, which
-/// is exactly the state the connection is in at this point.
+/// JSON chat message, then closes gracefully.
+///
+/// Order matters: the client has already sent its Login Start packet,
+/// which is sitting unread in our receive buffer. Dropping the socket
+/// with unread data makes the OS send an RST, which can destroy the
+/// disconnect message in flight — the client then sees nothing and
+/// times out. So: drain first, write, FIN, wait for the client to
+/// close its side.
 async fn send_login_disconnect(client: &mut TcpStream, json_text: &str) -> io::Result<()> {
+    // Drain the pending Login Start (and anything else queued).
+    let _ = timeout(Duration::from_millis(500), read_packet(client, 4096)).await;
+
     let json = format!(r#"{{"text":"{}"}}"#, json_text);
 
     let mut body = Vec::with_capacity(json.len() + 8);
@@ -334,6 +342,22 @@ async fn send_login_disconnect(client: &mut TcpStream, json_text: &str) -> io::R
 
     write_packet(client, &body).await?;
     client.flush().await?;
+
+    // Graceful close: send FIN after the data, then read until the
+    // client closes, so the kernel never RSTs our message away.
+    let _ = client.shutdown().await;
+    let mut sink = [0u8; 128];
+    let _ = timeout(Duration::from_secs(5), async {
+        loop {
+            match client.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+
+    println!("[conn] wake disconnect delivered");
     Ok(())
 }
 
