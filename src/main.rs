@@ -162,15 +162,20 @@ async fn handle_status_locally(client: &mut TcpStream, protocol: i32) -> io::Res
         match packet_id {
             // Status Request -> Status Response
             0x00 => {
-                // Echo the client's protocol version so the entry doesn't
-                // show up as "incompatible" in the server list.
+                // Report the real server version name (from the VERSION env var,
+                // e.g. "1.20.1") so launchers like Modrinth don't flag the entry
+                // as an incompatible version. Echo the client's protocol number
+                // so vanilla server lists show it as compatible too.
+                let version_name =
+                    std::env::var("VERSION").unwrap_or_else(|_| "Sleeping".to_string());
+
                 let json = format!(
                     concat!(
-                        r#"{{"version":{{"name":"Sleeping","protocol":{}}},"#,
+                        r#"{{"version":{{"name":"{}","protocol":{}}},"#,
                         r#""players":{{"max":0,"online":0}},"#,
                         r#""description":{{"text":"\u00a77\u26a1 Server is asleep \u2014 join to wake it up!"}}}}"#
                     ),
-                    protocol
+                    version_name, protocol
                 );
 
                 let mut body = Vec::with_capacity(json.len() + 8);
