@@ -5,10 +5,10 @@ use tokio::{
 };
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -17,6 +17,16 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 /// How long the background wake task keeps retrying before giving up.
 const WAKE_DEADLINE: Duration = Duration::from_secs(120);
+/// Slightly under Railway's 10-min idle window, so we never claim
+/// "up" when it has actually just gone back to sleep.
+const AWAKE_WINDOW: Duration = Duration::from_secs(9 * 60);
+
+#[derive(Clone, Copy)]
+enum SleepState {
+    Asleep,
+    Waking,
+    AwakeEmpty,
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -41,6 +51,9 @@ async fn main() -> io::Result<()> {
     let listener = TcpListener::bind(&bind_addr).await?;
     let active = Arc::new(AtomicUsize::new(0));
     let waking = Arc::new(AtomicBool::new(false));
+    // When we last *knew* the backend was up (wake success, successful
+    // probe, or a player session ending). None / expired = asleep.
+    let awake_until = Arc::new(Mutex::new(None::<Instant>));
 
     // Keepalive: only pings the backend while real players are connected
     {
@@ -70,11 +83,19 @@ async fn main() -> io::Result<()> {
 
         let active = active.clone();
         let waking = waking.clone();
+        let awake_until = awake_until.clone();
         let backend_addr = backend_addr.clone();
 
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_connection(client, &backend_addr, active, waking, login_hold_secs).await
+            if let Err(e) = handle_connection(
+                client,
+                &backend_addr,
+                active,
+                waking,
+                awake_until,
+                login_hold_secs,
+            )
+            .await
             {
                 println!("[conn] {}: {}", addr, e);
             }
@@ -95,6 +116,7 @@ async fn handle_connection(
     backend_addr: &str,
     active: Arc<AtomicUsize>,
     waking: Arc<AtomicBool>,
+    awake_until: Arc<Mutex<Option<Instant>>>,
     login_hold_secs: u64,
 ) -> io::Result<()> {
     let hs = timeout(HANDSHAKE_TIMEOUT, read_handshake(&mut client))
@@ -112,15 +134,20 @@ async fn handle_connection(
                 server.write_all(&hs.raw).await?;
                 let _ = io::copy_bidirectional(&mut client, &mut server).await;
             } else {
-                // Backend is (probably) asleep. Answer locally, never touch it.
-                let is_waking = waking.load(Ordering::Acquire);
-                println!(
-                    "[conn] status ping — answered locally (waking={}), backend untouched",
-                    is_waking
-                );
+                // Backend may be asleep. Answer locally, never touch it —
+                // any connection to the backend would reset Railway's idle timer.
+                let state = if waking.load(Ordering::Acquire) {
+                    SleepState::Waking
+                } else if is_probably_awake(&awake_until) {
+                    SleepState::AwakeEmpty
+                } else {
+                    SleepState::Asleep
+                };
+
+                println!("[conn] status ping — answered locally, backend untouched");
                 timeout(
                     STATUS_TIMEOUT,
-                    handle_status_locally(&mut client, hs.protocol, is_waking),
+                    handle_status_locally(&mut client, hs.protocol, state),
                 )
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "status timeout"))??;
@@ -137,6 +164,7 @@ async fn handle_connection(
                 Ok(Ok(server)) => {
                     // Awake: proxy the login normally.
                     waking.store(false, Ordering::Release);
+                    mark_awake(&awake_until);
 
                     let current = active.fetch_add(1, Ordering::AcqRel) + 1;
                     println!("[conn] login attempt, active connections: {}", current);
@@ -145,6 +173,8 @@ async fn handle_connection(
 
                     let current = active.fetch_sub(1, Ordering::AcqRel) - 1;
                     println!("[conn] connection ended, active: {}", current);
+                    // Server stays up ~10 more min after the last player leaves.
+                    mark_awake(&awake_until);
 
                     result
                 }
@@ -152,7 +182,7 @@ async fn handle_connection(
                     // Asleep: kick off the wake in the background (idempotent),
                     // then deal with the player gracefully.
                     println!("[conn] login while backend asleep — triggering wake");
-                    spawn_wake(backend_addr.to_string(), waking.clone());
+                    spawn_wake(backend_addr.to_string(), waking.clone(), awake_until.clone());
 
                     // Optionally hold the client, hoping the backend boots
                     // before the vanilla client gives up (~30s). If it comes
@@ -166,6 +196,8 @@ async fn handle_connection(
                         .await
                         {
                             println!("[conn] backend came up during hold — seamless join");
+                            mark_awake(&awake_until);
+
                             let current = active.fetch_add(1, Ordering::AcqRel) + 1;
                             println!("[conn] login attempt, active connections: {}", current);
 
@@ -173,6 +205,7 @@ async fn handle_connection(
 
                             let current = active.fetch_sub(1, Ordering::AcqRel) - 1;
                             println!("[conn] connection ended, active: {}", current);
+                            mark_awake(&awake_until);
 
                             return result;
                         }
@@ -199,10 +232,25 @@ async fn handle_connection(
     }
 }
 
+fn mark_awake(awake_until: &Mutex<Option<Instant>>) {
+    *awake_until.lock().unwrap() = Some(Instant::now() + AWAKE_WINDOW);
+}
+
+fn is_probably_awake(awake_until: &Mutex<Option<Instant>>) -> bool {
+    awake_until
+        .lock()
+        .unwrap()
+        .map_or(false, |t| Instant::now() < t)
+}
+
 /// Spawns (at most one) background task that hammers the backend with
 /// connection attempts until it's up. The connection attempts themselves
 /// are what trigger Railway to wake the service.
-fn spawn_wake(backend_addr: String, waking: Arc<AtomicBool>) {
+fn spawn_wake(
+    backend_addr: String,
+    waking: Arc<AtomicBool>,
+    awake_until: Arc<Mutex<Option<Instant>>>,
+) {
     // swap returns the previous value: if it was already true, a wake
     // task is running and we don't spawn a second one.
     if waking.swap(true, Ordering::AcqRel) {
@@ -212,7 +260,10 @@ fn spawn_wake(backend_addr: String, waking: Arc<AtomicBool>) {
     tokio::spawn(async move {
         println!("[wake] starting wake attempts");
         match connect_with_retry(&backend_addr, WAKE_DEADLINE).await {
-            Ok(_) => println!("[wake] backend is up"),
+            Ok(_) => {
+                println!("[wake] backend is up");
+                mark_awake(&awake_until);
+            }
             Err(e) => println!("[wake] gave up: {}", e),
         }
         waking.store(false, Ordering::Release);
@@ -272,12 +323,28 @@ async fn proxy_login(
     }
 }
 
-/// Answers the status request + ping/pong exchange ourselves with a
-/// "server is sleeping" (or "waking up") MOTD, without waking the backend.
+/// Escapes a plain-text string so it can be embedded inside a JSON string.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Answers the status request + ping/pong exchange ourselves,
+/// without touching the backend. The MOTD is built from the shared
+/// MOTD env var (plain text) plus a status suffix.
 async fn handle_status_locally(
     client: &mut TcpStream,
     protocol: i32,
-    is_waking: bool,
+    state: SleepState,
 ) -> io::Result<()> {
     loop {
         let payload = read_packet(client, 128).await?;
@@ -294,10 +361,25 @@ async fn handle_status_locally(
                 let version_name =
                     std::env::var("VERSION").unwrap_or_else(|_| "Sleeping".to_string());
 
-                let motd = if is_waking {
-                    r"\u00a7e\u26a1 Waking up... \u00a77refresh and join in a moment!"
-                } else {
-                    r"\u00a77\u26a1 Server is asleep \u2014 join to wake it up!"
+                // Shared with the itzg container via Railway shared/reference
+                // variable. Assumed plain text; escaped for JSON either way.
+                let motd_base = std::env::var("MOTD")
+                    .map(|m| json_escape(&m))
+                    .unwrap_or_else(|_| "Minecraft Server".to_string());
+
+                let motd = match state {
+                    SleepState::Waking => format!(
+                        r"{} \u00a78| \u00a7e\u26a1 Waking up... refresh in a moment!",
+                        motd_base
+                    ),
+                    SleepState::AwakeEmpty => format!(
+                        r"{} \u00a78| \u00a7a\u2714 Up \u2014 join right in!",
+                        motd_base
+                    ),
+                    SleepState::Asleep => format!(
+                        r"{} \u00a78| \u00a77\u26a1 Asleep \u2014 join to wake it up!",
+                        motd_base
+                    ),
                 };
 
                 let json = format!(
